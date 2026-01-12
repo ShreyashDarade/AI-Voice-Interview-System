@@ -1,0 +1,59 @@
+name: Daily Commit Automation
+
+on:
+  schedule:
+    # Runs every day at 6:00 AM IST (00:30 UTC)
+    - cron: "30 0 * * *"
+
+  # Allows manual trigger from GitHub UI
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  daily-commit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "${{ github.actor }}"
+          git config --global user.email "${{ github.actor }}@users.noreply.github.com"
+
+      - name: Generate Daily Update
+        run: |
+          mkdir -p .daily-logs
+          TIMESTAMP=$(TZ='Asia/Kolkata' date '+%Y-%m-%d %H:%M:%S IST')
+
+          echo "📅 Daily Update: $TIMESTAMP" >> .daily-logs/activity.log
+          echo "---" >> .daily-logs/activity.log
+
+          cat > .daily-logs/last_update.json << EOF
+          {
+            "last_updated": "$TIMESTAMP",
+            "run_number": "${{ github.run_number }}",
+            "triggered_by": "${{ github.event_name }}",
+            "repository": "${{ github.repository }}"
+          }
+          EOF
+
+          echo "✅ Generated daily update files"
+
+      - name: Commit and Push Changes
+        run: |
+          git add .
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            COMMIT_DATE=$(TZ='Asia/Kolkata' date '+%Y-%m-%d')
+            git commit -m "🤖 Daily Update: $COMMIT_DATE [automated]"
+            git push
+            echo "✅ Changes pushed successfully!"
+          fi
