@@ -1,6 +1,6 @@
 {
-  "last_updated": "2026-01-12 23:55:39 IST",
-  "run_number": "1",
-  "triggered_by": "workflow_dispatch",
+  "last_updated": "2026-01-13 08:00:36 IST",
+  "run_number": "2",
+  "triggered_by": "schedule",
   "repository": "ShreyashDarade/AI-Voice-Interview-System"
 }
