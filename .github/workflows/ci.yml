@@ -1,0 +1,23 @@
+name: CI
+on:
+  push: {branches: [main, "ccr-*"]}
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults: {run: {working-directory: backend}}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.13", cache: pip, cache-dependency-path: backend/requirements-dev.txt}
+      - name: System libraries (MediaPipe / OpenCV)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libegl1 libgles2 libgl1
+      - run: pip install -r requirements-dev.txt
+      - name: Vision models (cached, checksum-verified)
+        uses: actions/cache@v4
+        with: {path: backend/models, key: proctor-models-v1}
+      - run: python manage.py fetch_proctor_models
+        env: {SECRET_KEY: ci}
+      - run: python manage.py makemigrations --check --dry-run
+        env: {SECRET_KEY: ci}
+      - run: pytest -q

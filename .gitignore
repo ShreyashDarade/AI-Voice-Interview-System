@@ -77,3 +77,6 @@ logs/
 # Database backups
 *.sqlite3-backup
 *.db-backup
+
+# Vision model weights are downloaded, never committed
+backend/models/

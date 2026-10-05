@@ -35,6 +35,17 @@ class Resume(models.Model):
     education = models.JSONField(default=list, blank=True)
     work_history = models.JSONField(default=list, blank=True)
     
+    # Tenant that uploaded it (UUID of proctoring.Tenant; no FK to avoid an app dependency cycle)
+    owner_id = models.UUIDField(null=True, blank=True, db_index=True)
+
+    # Resume intelligence (offline engine, see resume/)
+    parse_schema_version = models.CharField(max_length=10, blank=True)
+    parse_confidence = models.FloatField(default=0.0)
+    integrity = models.JSONField(default=dict, blank=True)       # flags + risk from the resume integrity checks
+    probe_plan = models.JSONField(default=dict, blank=True)      # deterministic interview probe plan
+    content_sha256 = models.CharField(max_length=64, blank=True, db_index=True)
+    simhash = models.CharField(max_length=16, blank=True, db_index=True)
+
     # Metadata
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -96,7 +107,7 @@ class Interview(models.Model):
     start_time = models.DateTimeField(null=True, blank=True)
     end_time = models.DateTimeField(null=True, blank=True)
     
-    # Anti-cheating
+    # Integrity outcome (owned by proctoring.ProctorSession; mirrored here for convenience)
     strikes = models.IntegerField(
         default=0,
         validators=[MinValueValidator(0), MaxValueValidator(10)]
@@ -149,13 +160,6 @@ class Interview(models.Model):
         if reason:
             self.termination_reason = reason
         self.save(update_fields=['status', 'end_time', 'termination_reason', 'updated_at'])
-    
-    def add_strike(self):
-        """Add a cheating strike. Returns True if max strikes reached."""
-        from django.conf import settings
-        self.strikes += 1
-        self.save(update_fields=['strikes', 'updated_at'])
-        return self.strikes >= settings.MAX_STRIKES
     
     def get_duration_seconds(self):
         """Get interview duration in seconds."""
@@ -212,53 +216,3 @@ class Question(models.Model):
     
     def __str__(self):
         return f"{self.category} - {self.text[:50]}..."
-
-
-class CheatingEvent(models.Model):
-    """Records cheating detection events with validation."""
-    
-    class EventType(models.TextChoices):
-        LOOKING_AWAY = 'looking_away', 'Looking Away'
-        MULTIPLE_FACES = 'multiple_faces', 'Multiple Faces'
-        NO_FACE = 'no_face', 'No Face Detected'
-        SUSPICIOUS_PATTERN = 'suspicious_pattern', 'Suspicious Pattern'
-        TAB_SWITCH = 'tab_switch', 'Tab Switch'
-        WINDOW_BLUR = 'window_blur', 'Window Blur'
-        RIGHT_CLICK = 'right_click', 'Right Click'
-        COPY_ATTEMPT = 'copy_attempt', 'Copy Attempt'
-    
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    interview = models.ForeignKey(
-        Interview,
-        on_delete=models.CASCADE,
-        related_name='cheating_events',
-        db_index=True
-    )
-    
-    event_type = models.CharField(max_length=30, choices=EventType.choices)
-    confidence = models.FloatField(
-        default=0.0,
-        validators=[MinValueValidator(0.0), MaxValueValidator(1.0)]
-    )
-    details = models.JSONField(default=dict, blank=True)
-    
-    # Strike info
-    resulted_in_strike = models.BooleanField(default=False)
-    strike_number = models.IntegerField(null=True, blank=True)
-    
-    timestamp = models.DateTimeField(auto_now_add=True, db_index=True)
-    
-    class Meta:
-        ordering = ['-timestamp']
-        indexes = [
-            models.Index(fields=['interview', '-timestamp'], name='cheating_interview_idx'),
-            models.Index(fields=['event_type', '-timestamp'], name='cheating_type_idx'),
-        ]
-    
-    def __str__(self):
-        return f"{self.event_type} at {self.timestamp}"
-    
-    def clean(self):
-        """Validate model data."""
-        if self.resulted_in_strike and self.strike_number is None:
-            raise ValidationError("Strike number must be set when resulted_in_strike is True")

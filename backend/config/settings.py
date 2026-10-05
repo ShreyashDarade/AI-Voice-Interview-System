@@ -4,15 +4,12 @@ Security-hardened, performance-optimized, fully configured.
 """
 import os
 import sys
-import warnings
 import logging.config
 from pathlib import Path
 
-# Suppress TensorFlow warnings
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-warnings.filterwarnings('ignore', category=FutureWarning, module='keras')
-warnings.filterwarnings('ignore', category=DeprecationWarning, module='keras')
+# MediaPipe / TFLite are chatty on stderr
+os.environ.setdefault('GLOG_minloglevel', '2')
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
 
 from dotenv import load_dotenv
 
@@ -36,15 +33,21 @@ if not SECRET_KEY:
     print("WARNING: Using generated SECRET_KEY for development only")
 
 # Debug mode
-DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
+def _env_bool(name, default=False):
+    return os.getenv(name, str(default)).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+DEBUG = _env_bool('DEBUG', False)
 
 # Allowed hosts
-ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+ALLOWED_HOSTS = [h.strip() for h in os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',') if h.strip()]
 
-# Security middleware settings
-SECURE_BROWSER_XSS_FILTER = True
+# Security middleware settings (SECURE_BROWSER_XSS_FILTER was removed in Django 4.0)
 SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = 'DENY'
+SECURE_REFERRER_POLICY = 'same-origin'
+if _env_bool('TRUST_PROXY_SSL_HEADER'):
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 # HTTPS settings (enable in production)
 if not DEBUG:
@@ -71,6 +74,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'corsheaders',
     'core',
+    'proctoring',
     'api',
 ]
 
@@ -111,33 +115,30 @@ ASGI_APPLICATION = 'config.asgi.application'
 # CHANNELS CONFIGURATION
 # =============================================================================
 
-CHANNEL_LAYERS = {
-    'default': {
-        'BACKEND': 'channels.layers.InMemoryChannelLayer',
-        'CONFIG': {
-            'capacity': 1000,  # Maximum messages per channel
-            'expiry': 60,  # Message expiry in seconds
-        }
-    }
-}
+REDIS_URL = os.getenv('REDIS_URL', '')
+if REDIS_URL:
+    CHANNEL_LAYERS = {'default': {'BACKEND': 'channels_redis.core.RedisChannelLayer',
+                                  'CONFIG': {'hosts': [REDIS_URL], 'capacity': 1000, 'expiry': 60}}}
+else:
+    # Single-process only (dev/tests). Set REDIS_URL for more than one worker.
+    CHANNEL_LAYERS = {'default': {'BACKEND': 'channels.layers.InMemoryChannelLayer'}}
 
 # =============================================================================
 # DATABASE CONFIGURATION
 # =============================================================================
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
-        'OPTIONS': {
-            'timeout': 20,  # Prevent locks
-            'check_same_thread': False,  # Allow multi-threaded access
-        },
-        'CONN_MAX_AGE': 0,  # Don't pool SQLite connections
+if os.getenv('DATABASE_URL'):
+    import dj_database_url
+    DATABASES = {'default': dj_database_url.config(conn_max_age=60, conn_health_checks=True)}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+            'OPTIONS': {'timeout': 20},
+        }
     }
-}
 
-# Database optimization for SQLite
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # =============================================================================
@@ -250,10 +251,14 @@ USE_TZ = True
 
 STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
-STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+STORAGES = {
+    'default': {'BACKEND': 'django.core.files.storage.FileSystemStorage'},
+    'staticfiles': {'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+                    if not DEBUG else 'django.contrib.staticfiles.storage.StaticFilesStorage'},
+}
 
 MEDIA_URL = '/media/'
-MEDIA_ROOT = BASE_DIR / 'media'
+MEDIA_ROOT = Path(os.getenv('MEDIA_ROOT_OVERRIDE') or os.getenv('MEDIA_ROOT') or BASE_DIR / 'media')
 
 # Create media directory
 MEDIA_ROOT.mkdir(exist_ok=True)
@@ -293,7 +298,8 @@ REST_FRAMEWORK = {
         'anon': '1000/hour' if DEBUG else '100/hour',
         'upload': '100/hour' if DEBUG else '10/hour',
         'interview': '200/hour' if DEBUG else '20/hour',
-        'cheating': '500/hour' if DEBUG else '50/hour',
+        'proctor_create': '600/hour' if DEBUG else '120/hour',
+        'proctor_preflight': '600/hour' if DEBUG else '120/hour',
     },
     'EXCEPTION_HANDLER': 'api.exceptions.custom_exception_handler',
 }
@@ -342,14 +348,33 @@ AUDIO_MAX_BUFFER_SIZE_MB = int(os.getenv('AUDIO_MAX_BUFFER_SIZE_MB', '50'))
 AUDIO_CLEANUP_INTERVAL_SECONDS = int(os.getenv('AUDIO_CLEANUP_INTERVAL_SECONDS', '30'))
 
 # =============================================================================
-# ANTI-CHEATING CONFIGURATION
+# PROCTORING (see proctoring/ and docs/ARCHITECTURE.md)
 # =============================================================================
 
-MAX_STRIKES = int(os.getenv('MAX_STRIKES', '2'))
-CHEATING_CONFIDENCE_THRESHOLD = float(os.getenv('CHEATING_CONFIDENCE_THRESHOLD', '0.6'))
-CHEATING_CHECK_INTERVAL = float(os.getenv('CHEATING_CHECK_INTERVAL', '1.0'))
-CHEATING_TAB_SWITCH_ENABLED = os.getenv('CHEATING_TAB_SWITCH_ENABLED', 'True').lower() == 'true'
-CHEATING_FACE_DETECTION_ENABLED = os.getenv('CHEATING_FACE_DETECTION_ENABLED', 'True').lower() == 'true'
+PROCTOR = {
+    # model weights live here (fetch with `manage.py fetch_proctor_models`)
+    'MODEL_DIR': Path(os.getenv('PROCTOR_MODEL_DIR', BASE_DIR / 'models')),
+    'POOL_SIZE': int(os.getenv('PROCTOR_POOL_SIZE', '2')),       # concurrent model instances per process
+    'ENABLE_OBJECTS': _env_bool('PROCTOR_ENABLE_OBJECTS', True),
+    'ENABLE_IDENTITY': _env_bool('PROCTOR_ENABLE_IDENTITY', True),
+    'DEFAULT_POLICY': os.getenv('PROCTOR_DEFAULT_POLICY', 'standard'),
+    # candidate credentials
+    'TOKEN_SECRET': os.getenv('PROCTOR_TOKEN_SECRET', SECRET_KEY),
+    'TOKEN_TTL_S': int(os.getenv('PROCTOR_TOKEN_TTL_S', str(4 * 3600))),
+    # API-key auth for integrators (server-to-server). Required unless DEBUG.
+    'REQUIRE_API_KEY': _env_bool('PROCTOR_REQUIRE_API_KEY', not DEBUG),
+    # transport limits
+    'MAX_FRAME_BYTES': int(os.getenv('PROCTOR_MAX_FRAME_BYTES', '300000')),
+    'MAX_FRAME_RATE_HZ': float(os.getenv('PROCTOR_MAX_FRAME_RATE_HZ', '6')),
+    'MAX_WS_MESSAGE_BYTES': int(os.getenv('PROCTOR_MAX_WS_MESSAGE_BYTES', '400000')),
+    # retention / privacy
+    'EVIDENCE_RETENTION_DAYS': int(os.getenv('PROCTOR_EVIDENCE_RETENTION_DAYS', '30')),
+    'SESSION_RETENTION_DAYS': int(os.getenv('PROCTOR_SESSION_RETENTION_DAYS', '90')),
+    'CONSENT_VERSION': os.getenv('PROCTOR_CONSENT_VERSION', '2026-10'),
+    # webhooks
+    'WEBHOOK_TIMEOUT_S': float(os.getenv('PROCTOR_WEBHOOK_TIMEOUT_S', '8')),
+    'WEBHOOK_MAX_ATTEMPTS': int(os.getenv('PROCTOR_WEBHOOK_MAX_ATTEMPTS', '8')),
+}
 
 # =============================================================================
 # FILE UPLOAD CONFIGURATION
@@ -378,6 +403,8 @@ DATABASE_QUERY_TIMEOUT_SECONDS = int(os.getenv('DATABASE_QUERY_TIMEOUT_SECONDS',
 
 # Memory limits for processing
 MAX_RESUME_SIZE_MB = int(os.getenv('MAX_RESUME_SIZE_MB', '10'))
+# Parse uploads in a throw-away subprocess with a hard timeout (a hostile PDF cannot hang or crash a web worker)
+RESUME_ISOLATED_PARSE = _env_bool('RESUME_ISOLATED_PARSE', True)
 MAX_AUDIO_CHUNK_SIZE_KB = int(os.getenv('MAX_AUDIO_CHUNK_SIZE_KB', '256'))
 
 # =============================================================================

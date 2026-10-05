@@ -1,352 +1,211 @@
 """
-WebSocket consumers for real-time interview communication.
+Voice-interview WebSocket.
+
+Authentication, proctoring frames/telemetry and escalation come from
+``ProctorMixin`` (so the interview socket and the standalone proctoring socket
+behave identically). This class adds the Gemini voice bridge and feeds the
+proctoring pipeline the audio-side signals it needs (voice activity and answer
+latency) -- strictly server-side, never client-reported.
+
+Client -> server
+  binary  : raw float32 mic audio (16 kHz)              (legacy, unchanged)
+            b'PXF1' + 12-byte header + JPEG              (webcam frame, see proctoring.consumers)
+  text    : {"type":"events"|"heartbeat"|"complete", ...}   proctoring messages
+            {"type":"text","text":...}                     debug text input
+            {"type":"end_interview"}                        alias of "complete"
+Server -> client
+  binary  : 24 kHz PCM16 interviewer audio
+  text    : ready / status / notice / terminated / transcript / error
 """
-import json
 import asyncio
 import base64
+import json
 import logging
-from channels.generic.websocket import AsyncWebsocketConsumer
+import time
+
 from channels.db import database_sync_to_async
+from channels.generic.websocket import AsyncWebsocketConsumer
 from django.conf import settings
 
+from interview.audio_processor import AudioProcessor
 from interview.gemini_live import GeminiLiveClient
-from interview.tf_audio_processor import TFAudioProcessor
+from proctoring.consumers import SUBPROTOCOL, ProctorMixin
+from proctoring.models import ProctorSession
 
 logger = logging.getLogger(__name__)
 
+FRAME_MAGIC = b'PXF1'
+SILENCE_FRAMES_END_OF_TURN = 30      # ~3 s of silence at 100 ms frames
+MAX_TRANSCRIPT_CHARS = 200_000
 
-class InterviewConsumer(AsyncWebsocketConsumer):
-    """
-    WebSocket consumer for interview sessions.
-    Bridges client audio to Gemini Live API for voice interviews.
-    """
-    
+
+class InterviewConsumer(ProctorMixin, AsyncWebsocketConsumer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.interview_id = None
-        self.interview = None
         self.gemini_client = None
         self.receive_task = None
-        # Create audio processor with configured settings
-        self.audio_processor = TFAudioProcessor(
-            vad_energy_threshold=settings.VAD_ENERGY_THRESHOLD,
-            vad_zcr_threshold=settings.VAD_ZCR_THRESHOLD
-        )
-        self.audio_processor._speech_threshold = settings.VAD_SPEECH_FRAMES
-        self.audio_processor._silence_threshold = settings.VAD_SILENCE_FRAMES
-        self._audio_frame_count = 0
-        self._speech_detected_count = 0
-        # Turn management to prevent AI interruption
+        self.audio = AudioProcessor(
+            vad_energy_threshold=settings.VAD_ENERGY_THRESHOLD, vad_zcr_threshold=settings.VAD_ZCR_THRESHOLD,
+            speech_frames=settings.VAD_SPEECH_FRAMES, silence_frames=settings.VAD_SILENCE_FRAMES)
+        self._audio_frames = 0
         self._user_is_speaking = False
-        self._silence_frame_count = 0
+        self._silence_frames = 0
         self._turn_sent_audio = False
-        self._last_speech_time = 0
-    
+        self._transcript: list[dict] = []
+        self._transcript_chars = 0
+
+    # -- lifecycle ----------------------------------------------------------------
     async def connect(self):
-        """Handle WebSocket connection."""
-        self.interview_id = self.scope['url_route']['kwargs']['interview_id']
-        logger.info(f"[Consumer] WebSocket connection request for interview: {self.interview_id}")
-        
-        # Validate interview exists and is in progress
-        self.interview = await self.get_interview()
-        
-        if not self.interview:
-            logger.error(f"[Consumer] Interview not found: {self.interview_id}")
-            await self.close(code=4004)
+        if not await self.proctor_connect():
             return
-        
-        if self.interview.status != 'in_progress':
-            logger.error(f"[Consumer] Interview not in progress: {self.interview.status}")
-            await self.close(code=4001)
+        state = await database_sync_to_async(lambda: ProctorSession.objects.values_list('state', flat=True).get(pk=self.session_id))()
+        if state != ProctorSession.State.ACTIVE:
+            await self.proctor_disconnect()
+            await self.close(code=4012)              # session not started yet
             return
-        
-        await self.accept()
-        logger.info(f"[Consumer] WebSocket accepted for interview: {self.interview_id}")
-        logger.info(f"[Consumer] VAD configured - Energy: {settings.VAD_ENERGY_THRESHOLD}, ZCR: {settings.VAD_ZCR_THRESHOLD}, Noise Suppression: {settings.NOISE_SUPPRESSION_ENABLED}")
-        
-        # Initialize Gemini Live client
+        subs = self.scope.get('subprotocols') or []
+        await self.accept(subprotocol=SUBPROTOCOL if SUBPROTOCOL in subs else None)
+        await self.proctor_ready_message()
         try:
-            logger.info("[Consumer] Initializing Gemini client...")
-            self.gemini_client = GeminiLiveClient(
-                interview_id=self.interview_id,
-                resume_data=self.interview.resume.parsed_data,
-                experience_level=self.interview.experience_level,
-                on_audio_response=self.send_audio_to_client,
-                on_text_response=self.send_text_to_client,
-                on_error=self.handle_gemini_error
-            )
-            
-            logger.info("[Consumer] Connecting to Gemini...")
-            await self.gemini_client.connect()
-            
-            # Start receiving from Gemini in background
-            self.receive_task = asyncio.create_task(self.gemini_client.receive_loop())
-            logger.info("[Consumer] Gemini receive loop started")
-            
-            # Send connection success
-            await self.send(text_data=json.dumps({
-                'type': 'connected',
-                'message': 'Interview session started',
-                'interview_id': self.interview_id
-            }))
-            logger.info("[Consumer] Sent connection success to client")
-            
-        except Exception as e:
-            logger.error(f"[Consumer] Failed to connect to Gemini: {type(e).__name__}: {str(e)}")
-            await self.send(text_data=json.dumps({
-                'type': 'error',
-                'message': f'Failed to connect to AI: {str(e)}'
-            }))
+            await self._start_gemini()
+        except Exception as exc:                      # noqa: BLE001
+            logger.error('[Consumer] Gemini start failed: %s', type(exc).__name__)
+            await self.send(text_data=json.dumps({'type': 'error', 'code': 'ai_unavailable',
+                                                  'message': 'Could not connect to the AI interviewer.'}))
             await self.close(code=4002)
-    
-    async def disconnect(self, close_code):
-        """Handle WebSocket disconnection."""
-        logger.info(f"[Consumer] WebSocket disconnect requested, code: {close_code}")
-        logger.info(f"[Consumer] Audio stats - Total frames: {self._audio_frame_count}, Speech detected: {self._speech_detected_count}, Filter rate: {((self._audio_frame_count - self._speech_detected_count) / max(self._audio_frame_count, 1) * 100):.1f}%")
-        # Cancel receive task
+
+    async def _start_gemini(self):
+        interview = await database_sync_to_async(self._load_interview)()
+        resume = dict(interview.resume.parsed_data or {})
+        resume.setdefault('name', interview.resume.candidate_name)
+        resume.setdefault('skills', interview.resume.skills)
+        self.gemini_client = GeminiLiveClient(
+            interview_id=str(interview.id), resume_data=resume, experience_level=interview.experience_level,
+            on_audio_response=self.send_audio_to_client, on_text_response=self.send_text_to_client,
+            on_error=self.handle_gemini_error, on_turn_complete=self._on_ai_turn_complete,
+            on_transcript=self._on_transcript,
+            resumption_handle=(interview.session_data or {}).get('gemini_resumption_handle'))
+        await self.gemini_client.connect()
+        self.receive_task = asyncio.create_task(self.gemini_client.receive_loop())
+        await self.send(text_data=json.dumps({'type': 'connected', 'interview_id': str(interview.id)}))
+
+    def _load_interview(self):
+        s = ProctorSession.objects.select_related('interview__resume').get(pk=self.session_id)
+        return s.interview
+
+    async def disconnect(self, code):
         if self.receive_task:
             self.receive_task.cancel()
             try:
                 await self.receive_task
-            except asyncio.CancelledError:
-                # Expected when task is cancelled - cleanup then re-raise
-                await self._cleanup_connection()
-                raise  # Re-raise CancelledError as required by asyncio
-        
-        await self._cleanup_connection()
-    
-    async def _cleanup_connection(self):
-        """Clean up resources on disconnect."""
-        # Close Gemini connection
+            except (asyncio.CancelledError, Exception):      # noqa: BLE001
+                pass
         if self.gemini_client:
+            handle = self.gemini_client.resumption_handle
             await self.gemini_client.close()
-        
-        # Update interview if still in progress
-        if self.interview and self.interview.status == 'in_progress':
-            await self.end_interview()
-    
+            await database_sync_to_async(self._persist_session_data)(handle)
+        await self.proctor_disconnect()       # saves detector state, marks session PAUSED (resumable)
+
+    def _persist_session_data(self, handle):
+        from core.models import Interview
+        s = ProctorSession.objects.filter(pk=self.session_id).select_related('interview').first()
+        if not s:
+            return
+        i = s.interview
+        data = dict(i.session_data or {})
+        if handle:
+            data['gemini_resumption_handle'] = handle
+        if self._transcript:
+            data['transcript'] = (data.get('transcript', []) + self._transcript)[-2000:]
+            self._transcript = []
+        i.session_data = data
+        i.save(update_fields=['session_data', 'updated_at'])
+
+    # -- inbound ----------------------------------------------------------------
     async def receive(self, text_data=None, bytes_data=None):
-        """Handle incoming WebSocket messages."""
+        if self.session_id is None:
+            return
         try:
             if bytes_data:
-                await self._handle_binary_audio(bytes_data)
+                if bytes_data.startswith(FRAME_MAGIC):
+                    await self.proctor_binary(bytes_data[len(FRAME_MAGIC):])
+                else:
+                    await self._handle_binary_audio(bytes_data)
             elif text_data:
-                await self._handle_text_message(text_data)
-        except json.JSONDecodeError:
-            await self._send_error('Invalid JSON')
-        except Exception as e:
-            await self._send_error(str(e))
-    
-    async def _handle_binary_audio(self, bytes_data: bytes):
-        """Handle binary audio data from client with turn-based VAD (prevents AI interruption)."""
-        if not self.gemini_client:
+                if len(text_data) > settings.PROCTOR['MAX_WS_MESSAGE_BYTES']:
+                    return
+                data = json.loads(text_data)
+                if data.get('type') == 'end_interview':
+                    data = {'type': 'complete'}
+                if await self.proctor_text(data):
+                    return
+                if data.get('type') == 'audio':
+                    await self._send_to_gemini(base64.b64decode(data['data']))
+                elif data.get('type') == 'text' and self.gemini_client:
+                    await self.gemini_client.send_text(str(data.get('text', ''))[:2000])
+        except (json.JSONDecodeError, KeyError, ValueError):
+            await self.send(text_data=json.dumps({'type': 'error', 'code': 'bad_message'}))
+        except Exception:                                      # noqa: BLE001
+            logger.exception('[Consumer] receive failed')
+            await self.send(text_data=json.dumps({'type': 'error', 'code': 'internal'}))
+
+    async def _send_to_gemini(self, pcm: bytes):
+        if self.gemini_client and len(pcm) <= settings.MAX_AUDIO_CHUNK_SIZE_KB * 1024:
+            await self.gemini_client.send_audio(pcm)
+
+    async def _handle_binary_audio(self, data: bytes):
+        if not self.gemini_client or len(data) > settings.MAX_AUDIO_CHUNK_SIZE_KB * 1024:
             return
-        
-        self._audio_frame_count += 1
-        import time
-        current_time = time.time()
-            
-        # Process audio with TF processor (noise suppression + normalization + VAD)
+        self._audio_frames += 1
         try:
-            pcm16_data, is_speech = self.audio_processor.process_audio(
-                bytes_data, 
-                input_format='float32'
-            )
-            
-            # Debug logging every 100 frames
-            if self._audio_frame_count % 100 == 0:
-                energy = self.audio_processor.get_energy(bytes_data)
-                logger.debug(f"[VAD] Frame {self._audio_frame_count}: energy={energy:.4f}, noise_floor={self.audio_processor._noise_floor_energy:.4f}, is_speech={is_speech}, user_speaking={self._user_is_speaking}")
-            
-            # TURN MANAGEMENT: Process based on speech detection
-            await self._process_turn_management(is_speech, pcm16_data, current_time)
-                
-        except Exception as e:
-            logger.warning(f"[VAD] Audio processing failed: {e}, using fallback")
-            # Fallback: send raw audio without processing
-            await self.gemini_client.send_audio(bytes_data)
-    
-    async def _process_turn_management(self, is_speech: bool, pcm16_data: bytes, current_time: float):
-        """Process turn management based on speech detection."""
+            pcm16, is_speech = self.audio.process_audio(data, input_format='float32')
+        except Exception:                                      # noqa: BLE001
+            logger.warning('[VAD] processing failed; dropping chunk')
+            return
+        # Ignore the mic while the interviewer speaks: it is echo, not the candidate.
+        if self.gemini_client.ai_is_speaking:
+            return
         if is_speech:
-            await self._handle_speech_detected(pcm16_data, current_time)
+            await self._on_speech(pcm16)
         else:
-            await self._handle_silence_detected()
-    
-    async def _handle_speech_detected(self, pcm16_data: bytes, current_time: float):
-        """Handle when speech is detected."""
-        # User is speaking
+            await self._on_silence()
+
+    async def _on_speech(self, pcm16: bytes):
         if not self._user_is_speaking:
-            # User started speaking - begin new turn
-            self._user_is_speaking = True
-            self._turn_sent_audio = False
-            logger.info("[TURN] User started speaking")
-            
-            # If AI is speaking, send barge-in signal ONCE
-            if self.gemini_client.ai_is_speaking:
-                logger.info("[TURN] User barge-in detected - interrupting AI")
-                await self.gemini_client.send_text("[User interrupted]")
-        
-        # Reset silence counter
-        self._silence_frame_count = 0
-        self._last_speech_time = current_time
-        
-        # Send audio during user's turn
-        if len(pcm16_data) > 0:
-            self._speech_detected_count += 1
+            self._user_is_speaking, self._turn_sent_audio = True, False
+            now = time.time()
+            await self.proctor_event('vad', {'speech': True}, 'server')
+            await self.proctor_event('turn', {'phase': 'user_start'}, 'server')
+        self._silence_frames = 0
+        if pcm16:
             self._turn_sent_audio = True
-            await self.gemini_client.send_audio(pcm16_data)
-    
-    async def _handle_silence_detected(self):
-        """Handle when silence is detected."""
-        # No speech detected
-        if self._user_is_speaking:
-            # User was speaking - count silence frames
-            self._silence_frame_count += 1
-            
-            # If silence exceeds threshold (e.g., 30 frames ~3 seconds at 100ms/frame)
-            # User has finished their turn
-            if self._silence_frame_count >= 30:
-                if self._turn_sent_audio:
-                    # Complete the turn - signal to Gemini
-                    logger.info(f"[TURN] User finished speaking (silence: {self._silence_frame_count} frames)")
-                    await self.gemini_client.send_turn_complete()
-                
-                # Reset turn state
-                self._user_is_speaking = False
-                self._silence_frame_count = 0
-                self._turn_sent_audio = False
-    
-    async def _handle_text_message(self, text_data: str):
-        """Handle text-based WebSocket messages."""
-        data = json.loads(text_data)
-        message_type = data.get('type')
-        
-        handlers = {
-            'audio': lambda: self._handle_base64_audio(data),
-            'text': lambda: self._handle_text_input(data),
-            'cheating_detected': lambda: self.handle_cheating_event(data),
-            'end_interview': self._handle_end_request,
-        }
-        
-        handler = handlers.get(message_type)
-        if handler:
-            await handler()
-    
-    async def _handle_base64_audio(self, data: dict):
-        """Handle base64-encoded audio."""
-        audio_bytes = base64.b64decode(data['data'])
-        if self.gemini_client:
-            await self.gemini_client.send_audio(audio_bytes)
-    
-    async def _handle_text_input(self, data: dict):
-        """Handle text input for testing."""
-        if self.gemini_client:
-            await self.gemini_client.send_text(data['text'])
-    
-    async def _handle_end_request(self):
-        """Handle interview end request."""
-        await self.end_interview()
-        await self.close()
-    
-    async def _send_error(self, message: str):
-        """Send error message to client."""
-        await self.send(text_data=json.dumps({'type': 'error', 'message': message}))
-    
-    async def send_audio_to_client(self, audio_data: bytes):
-        """Send audio response to client (24kHz PCM from Gemini)."""
-        await self.send(bytes_data=audio_data)
-    
-    async def send_text_to_client(self, text: str):
-        """Send text response to client."""
-        await self.send(text_data=json.dumps({
-            'type': 'transcript',
-            'text': text
-        }))
-    
-    async def handle_gemini_error(self, error: str):
-        """Handle errors from Gemini."""
-        await self.send(text_data=json.dumps({
-            'type': 'error',
-            'message': error
-        }))
-    
-    async def handle_cheating_event(self, data: dict):
-        """Handle cheating detection event."""
-        confidence = data.get('confidence', 0.0)
-        
-        if confidence < settings.CHEATING_CONFIDENCE_THRESHOLD:
+            await self.gemini_client.send_audio(pcm16)
+
+    async def _on_silence(self):
+        if not self._user_is_speaking:
             return
-        
-        # Add strike
-        strikes = await self.add_strike()
-        max_strikes = settings.MAX_STRIKES
-        
-        # Send warning
-        if strikes >= max_strikes:
-            await self.send(text_data=json.dumps({
-                'type': 'terminated',
-                'message': 'Interview terminated due to suspected cheating.',
-                'strikes': strikes
-            }))
-            await self.terminate_interview()
-            await self.close(code=4003)
-        else:
-            warning = self._get_warning_message(strikes)
-            await self.send(text_data=json.dumps({
-                'type': 'warning',
-                'message': warning,
-                'strikes': strikes,
-                'max_strikes': max_strikes
-            }))
-            
-            # Have AI acknowledge the warning
-            if self.gemini_client:
-                await self.gemini_client.send_text(
-                    f"[System: Warning issued to candidate. Strike {strikes} of {max_strikes}]"
-                )
-    
-    
-    def _get_warning_message(self, strikes: int) -> str:
-        """Generate warning message based on strike count."""
-        if strikes == 1:
-            return "STRIKE 1/2: Suspicious activity detected. One more violation will terminate your interview."
-        elif strikes == 2:
-            return "FINAL STRIKE: Interview will be terminated immediately on next violation."
-        return "Interview terminated."
-    
-    @database_sync_to_async
-    def get_interview(self):
-        """Get interview from database."""
-        from core.models import Interview
-        try:
-            return Interview.objects.select_related('resume').get(id=self.interview_id)
-        except Interview.DoesNotExist:
-            return None
-    
-    @database_sync_to_async
-    def add_strike(self):
-        """Add a strike to the interview."""
-        from core.models import Interview
-        interview = Interview.objects.get(id=self.interview_id)
-        interview.strikes += 1
-        interview.save()
-        return interview.strikes
-    
-    @database_sync_to_async
-    def end_interview(self):
-        """End the interview."""
-        from core.models import Interview
-        interview = Interview.objects.get(id=self.interview_id)
-        if interview.status == 'in_progress':
-            interview.end()
-    
-    @database_sync_to_async
-    def terminate_interview(self):
-        """Terminate the interview due to cheating."""
-        from core.models import Interview
-        interview = Interview.objects.get(id=self.interview_id)
-        interview.end(
-            terminated=True,
-            reason=f"Terminated after {settings.MAX_STRIKES} cheating violations."
-        )
+        self._silence_frames += 1
+        if self._silence_frames >= SILENCE_FRAMES_END_OF_TURN:
+            if self._turn_sent_audio:
+                await self.gemini_client.send_turn_complete()
+            self._user_is_speaking, self._silence_frames, self._turn_sent_audio = False, 0, False
+            await self.proctor_event('vad', {'speech': False}, 'server')
+
+    # -- outbound ---------------------------------------------------------------
+    async def send_audio_to_client(self, audio: bytes):
+        await self.send(bytes_data=audio)
+
+    async def send_text_to_client(self, text: str):
+        await self.send(text_data=json.dumps({'type': 'transcript', 'role': 'interviewer', 'text': text}))
+
+    async def handle_gemini_error(self, message: str):
+        await self.send(text_data=json.dumps({'type': 'error', 'code': 'ai', 'message': message}))
+
+    async def _on_ai_turn_complete(self):
+        await self.proctor_event('turn', {'phase': 'ai_end'}, 'server')
+
+    async def _on_transcript(self, role: str, text: str):
+        if self._transcript_chars < MAX_TRANSCRIPT_CHARS:
+            self._transcript.append({'role': role, 'text': text, 'ts': time.time()})
+            self._transcript_chars += len(text)
+        await self.send(text_data=json.dumps({'type': 'transcript', 'role': role, 'text': text}))

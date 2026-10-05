@@ -1,0 +1,3 @@
+# Optional: OCR fallback for scanned PDF resumes. Also needs the `tesseract-ocr` system package.
+-r requirements.txt
+pytesseract>=0.3,<1

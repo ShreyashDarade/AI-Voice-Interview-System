@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Resume, Interview, Question, CheatingEvent
+from .models import Resume, Interview, Question
 
 
 @admin.register(Resume)
@@ -23,9 +23,3 @@ class QuestionAdmin(admin.ModelAdmin):
     list_display = ['id', 'interview', 'category', 'difficulty', 'asked_at']
     list_filter = ['category', 'difficulty']
     search_fields = ['text']
-
-
-@admin.register(CheatingEvent)
-class CheatingEventAdmin(admin.ModelAdmin):
-    list_display = ['id', 'interview', 'event_type', 'confidence', 'resulted_in_strike', 'timestamp']
-    list_filter = ['event_type', 'resulted_in_strike', 'timestamp']

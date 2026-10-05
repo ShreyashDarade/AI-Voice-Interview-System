@@ -5,8 +5,7 @@ from django.urls import path
 from .views import (
     HealthCheckView,
     ResumeUploadView, ResumeDetailView,
-    InterviewStartView, InterviewStatusView, InterviewEndView,
-    CheatingReportView
+    InterviewStartView, InterviewStatusView, InterviewEndView, InterviewEvaluateView,
 )
 
 urlpatterns = [
@@ -21,7 +20,5 @@ urlpatterns = [
     path('interview/start/', InterviewStartView.as_view(), name='interview-start'),
     path('interview/<uuid:interview_id>/status/', InterviewStatusView.as_view(), name='interview-status'),
     path('interview/<uuid:interview_id>/end/', InterviewEndView.as_view(), name='interview-end'),
-    
-    # Cheating detection
-    path('cheating/report/', CheatingReportView.as_view(), name='cheating-report'),
+    path('interview/<uuid:interview_id>/evaluate/', InterviewEvaluateView.as_view(), name='interview-evaluate'),
 ]
