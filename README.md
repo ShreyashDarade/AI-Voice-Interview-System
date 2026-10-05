@@ -1,169 +1,72 @@
-# AI Interview Taker
+# AI Voice Interview + Proctoring Backend
 
-Production-ready AI-powered voice interview system using Google Gemini Live API with real-time cheating detection and advanced audio processing.
+A **backend-only** (REST + WebSocket + webhooks) platform that runs an AI voice interview and proctors it:
 
-## 🚀 Features
+* **Proctoring engine** – plugin *framework* (detectors → signals → explainable risk engine → tamper-evident log),
+  on-device video analysis with **no LLM**: face presence/extra people, per-candidate-calibrated gaze & head pose,
+  phones/books/second persons, identity continuity, frozen/static/looped feeds, audio-visual desync, answer-latency
+  signature, signed browser telemetry. Presets `lenient | standard | strict`, accommodations, consent, evidence stills,
+  retention/erasure, signed webhooks, full session report.
+* **Resume engine** – offline, rule-based, layout-aware parsing with integrity flags and a deterministic interview
+  probe plan (`backend/resume/`).
+* **Voice interviewer** – Gemini Live via the official `google-genai` SDK, with session resumption.
+* **Optional LLM helpers** (text only; Anthropic / OpenAI-compatible / local Ollama; off unless configured; never in
+  proctoring).
 
-- **Real-time Voice Interview**: Powered by Google Gemini 2.5 Flash with native audio
-- **Smart Audio Processing**: TensorFlow-based VAD with noise suppression
-- **Anti-Cheating System**: Multi-layer detection (face, tab switching, window blur, copy attempts)
-- **Turn-Based Communication**: Prevents AI interruption mid-sentence
-- **Production-Ready**: Security hardening, rate limiting, structured logging
-- **Detailed Analytics**: AI-generated interview evaluation and violation reporting
+Read: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`docs/API.md`](docs/API.md) ·
+[`docs/COMPETITIVE_ANALYSIS.md`](docs/COMPETITIVE_ANALYSIS.md) · [`docs/COMPLIANCE.md`](docs/COMPLIANCE.md) ·
+[`backend/resume/README.md`](backend/resume/README.md)
 
-## 📋 Prerequisites
+> `frontend/` is the legacy demo client. It predates the token/consent/proctoring protocol and **does not work against
+> this backend until updated** (it opens the voice socket without a candidate token). The backend contract is in `docs/API.md`.
 
-- Python 3.9+
-- Node.js 16+
-- Google Gemini API Key ([Get it here](https://makersuite.google.com/app/apikey))
+## Quick start
 
-## 🛠️ Installation
-
-### Backend Setup
-
-```bash
-cd backend
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-### Frontend Setup
-
-```bash
-cd frontend
-npm install
-```
-
-## ⚙️ Configuration
-
-1. Copy `.env.example` to `.env`:
-```bash
-cp .env.example .env
-```
-
-2. Configure your `.env` file:
-```env
-SECRET_KEY=<generate-with-python-secrets>
-GEMINI_API_KEY=<your-gemini-api-key>
-DEBUG=True
-MAX_STRIKES=2
-```
-
-## 🚀 Running the Application
-
-### Backend
+Requires **Python ≥ 3.12** (Django 6.1, NumPy 2.5; tested on 3.13).
 
 ```bash
 cd backend
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+# MediaPipe 1.0 / OpenCV need system libs on Linux:  sudo apt install libegl1 libgles2 libgl1
+cp ../.env.example .env                    # set GEMINI_API_KEY for voice
 python manage.py migrate
-python manage.py runserver
+python manage.py fetch_proctor_models      # ~50 MB, SHA-256 verified, never committed
+python manage.py create_tenant "My ATS"    # prints the API key once
+daphne -b 127.0.0.1 -p 8000 config.asgi:application
+python manage.py proctor_watchdog          # separate process: pause/expire sessions, deliver webhooks
 ```
 
-### Frontend
+Docker: `docker compose up --build` (Postgres + Redis + API + watchdog + purge).
+
+## Tests
 
 ```bash
-cd frontend
-npm run dev
+cd backend && pytest -q                                   # ~200 tests, offline
+# real-model integration tests (head-pose sign convention, calibration, duplicate/static feeds, WS with real video):
+PROCTOR_TEST_PORTRAIT=/path/to/frontal_face.jpg pytest -q proctoring/tests/test_vision_models.py proctoring/tests/test_ws.py
 ```
 
-Access the application at `http://localhost:5173`
-
-## 📁 Project Structure
+## Layout
 
 ```
-├── backend/
-│   ├── api/              # REST API & WebSocket consumers
-│   ├── core/             # Database models
-│   ├── interview/        # Interview logic, Gemini client, audio processing
-│   ├── config/           # Django settings
-│   └── logs/             # Application logs
-├── frontend/
-│   └── src/              # React application
-└── PRODUCTION_READY.md   # Deployment guide
+backend/
+  proctoring/   framework/ (types, detector API, policy, scoring, pipeline, tokens, audit)  vision/  detectors/
+                services.py consumers.py views.py webhooks.py models.py management/commands/
+  resume/       offline resume engine            llm/         optional text-only LLM helpers
+  interview/    Gemini Live client, audio front-end (NumPy), question generator
+  api/          REST (resume, interview, health), voice WebSocket
+  core/         Resume / Interview models        config/      settings (+ settings_test)
+docs/           architecture · API · competitors · compliance
 ```
 
-## 🔒 Security Features
+## Status & honest limits
 
-- ✅ Rate limiting on all endpoints
-- ✅ Input validation and sanitization
-- ✅ CORS properly configured
-- ✅ Security headers (HSTS, XSS protection)
-- ✅ Structured error handling
-- ✅ Database indexes and constraints
-
-## 📊 Anti-Cheating Detection
-
-1. **Face Detection**: Using browser FaceDetector API
-2. **Tab Switching**: Immediate detection with visibility API
-3. **Window Blur**: Focus loss monitoring
-4. **Right-Click/Copy**: Prevention and reporting
-5. **2-Strike System**: Automatic termination on violations
-
-## 🎯 Production Deployment
-
-See [PRODUCTION_READY.md](./PRODUCTION_READY.md) for:
-- Environment configuration
-- systemd service setup
-- Nginx configuration
-- Security checklist
-- Monitoring setup
-
-## 📝 Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `SECRET_KEY` | Django secret key | Required |
-| `GEMINI_API_KEY` | Google Gemini API key | Required |
-| `DEBUG` | Debug mode | `False` |
-| `MAX_STRIKES` | Strikes before termination | `2` |
-| `CHEATING_CONFIDENCE_THRESHOLD` | Detection threshold | `0.6` |
-
-## 🔧 Technology Stack
-
-### Backend
-- Django 5.2 + Channels (WebSocket)
-- Google Gemini Live API
-- TensorFlow (Audio processing)
-- SQLite (Development) / PostgreSQL (Production recommended)
-
-### Frontend
-- React 18
-- Vite
-- WebSocket API
-- Browser FaceDetector API
-
-## 📈 Production Readiness Score
-
-- **Security**: 85/100 ✅
-- **Performance**: 80/100 ✅
-- **Reliability**: 90/100 ✅
-- **Operational**: 85/100 ✅
-
-**Overall: Production Ready** ✅
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Commit your changes
-4. Push to the branch
-5. Open a Pull Request
-
-## 📄 License
-
-MIT License - See LICENSE file for details
-
-## 👤 Author
-
-Shreyash Darade
-
-## 🙏 Acknowledgments
-
-- Google Gemini API for real-time voice capabilities
-- Django & React communities
-- TensorFlow for audio processing
-
----
-
-**Status**: Production Ready | **Version**: 1.0.0
+* Heuristic detectors (`reading_pattern`, `static_image_suspected`, gaze thresholds) are validated on synthetic data and a
+  single portrait only. Calibrate on your own labelled data and run a bias evaluation across skin tones, lighting,
+  glasses and head coverings **before** relying on them. Signals are evidence for human review, not proof.
+* Overlay copilots (Cluely-style) and off-camera second devices cannot be detected from video; see
+  `docs/COMPETITIVE_ANALYSIS.md` §4.
+* The Gemini Live path was ported to the current SDK and unit-tested with a fake client; it has **not** been run against the
+  live API from this repo. Verify `GEMINI_MODEL` against Google's current Live model list.
+* Model weights licences need a legal review before commercial launch (`docs/COMPLIANCE.md`).

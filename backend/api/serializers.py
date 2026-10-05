@@ -2,28 +2,20 @@
 Serializers for AI Interviewer API.
 """
 from rest_framework import serializers
-from core.models import Resume, Interview, Question, CheatingEvent
+from core.models import Resume, Interview, Question
 
 
 class ResumeUploadSerializer(serializers.Serializer):
-    """Serializer for resume upload."""
+    """Cheap pre-checks only; the resume engine verifies the real file type from magic bytes."""
     file = serializers.FileField()
-    
+
     def validate_file(self, value):
-        """Validate file type and size."""
-        allowed_types = ['application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'text/plain']
-        max_size = 10 * 1024 * 1024  # 10MB
-        
-        if value.content_type not in allowed_types:
-            raise serializers.ValidationError(
-                "Unsupported file type. Please upload PDF, DOCX, or TXT."
-            )
-        
-        if value.size > max_size:
-            raise serializers.ValidationError(
-                "File too large. Maximum size is 10MB."
-            )
-        
+        from django.conf import settings
+        ext = value.name.rsplit('.', 1)[-1].lower() if '.' in value.name else ''
+        if ext not in settings.ALLOWED_RESUME_EXTENSIONS:
+            raise serializers.ValidationError("Unsupported file type. Please upload PDF, DOCX, or TXT.")
+        if value.size > settings.MAX_RESUME_SIZE_MB * 1024 * 1024:
+            raise serializers.ValidationError(f"File too large. Maximum size is {settings.MAX_RESUME_SIZE_MB}MB.")
         return value
 
 
@@ -34,28 +26,36 @@ class ResumeSerializer(serializers.ModelSerializer):
         model = Resume
         fields = [
             'id', 'original_filename', 'candidate_name', 'email', 'phone',
-            'experience_years', 'skills', 'education', 'work_history',
-            'parsed_data', 'created_at'
+            'experience_years', 'skills', 'education', 'work_history', 'created_at'
         ]
         read_only_fields = ['id', 'created_at']
 
 
 class ResumeDetailSerializer(serializers.ModelSerializer):
-    """Detailed serializer for Resume with all fields."""
-    
+    """Everything except the raw text/file path/internal prompt (PII minimisation)."""
+
     class Meta:
         model = Resume
-        fields = '__all__'
+        exclude = ['raw_text', 'file', 'owner_id', 'content_sha256', 'simhash']
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data['parsed_data'] = {k: v for k, v in (data.get('parsed_data') or {}).items() if k != 'probe_prompt'}
+        return data
 
 
 class InterviewCreateSerializer(serializers.Serializer):
-    """Serializer for starting an interview."""
+    """Serializer for creating an interview + proctoring session."""
     resume_id = serializers.UUIDField()
     experience_level = serializers.ChoiceField(
         choices=Interview.ExperienceLevel.choices,
         default=Interview.ExperienceLevel.FRESHER
     )
+    policy = serializers.ChoiceField(choices=['lenient', 'standard', 'strict'], required=False)
+    policy_overrides = serializers.DictField(required=False, default=dict)
+    accommodations = serializers.ListField(child=serializers.CharField(), required=False, default=list)
+    external_ref = serializers.CharField(max_length=128, required=False, allow_blank=True, default='')
     
     def validate_resume_id(self, value):
         """Validate resume exists."""
@@ -97,36 +97,6 @@ class QuestionSerializer(serializers.ModelSerializer):
             'skill_tag', 'asked_at', 'response'
         ]
         read_only_fields = ['id']
-
-
-class CheatingEventSerializer(serializers.ModelSerializer):
-    """Serializer for CheatingEvent model."""
-    
-    class Meta:
-        model = CheatingEvent
-        fields = [
-            'id', 'event_type', 'confidence', 'details',
-            'resulted_in_strike', 'strike_number', 'timestamp'
-        ]
-        read_only_fields = ['id', 'timestamp']
-
-
-class CheatingReportSerializer(serializers.Serializer):
-    """Serializer for reporting cheating detection."""
-    interview_id = serializers.UUIDField()
-    event_type = serializers.ChoiceField(choices=CheatingEvent.EventType.choices)
-    confidence = serializers.FloatField(min_value=0.0, max_value=1.0)
-    details = serializers.JSONField(required=False, default=dict)
-    
-    def validate_interview_id(self, value):
-        """Validate interview exists and is in progress."""
-        try:
-            interview = Interview.objects.get(id=value)
-            if interview.status != Interview.Status.IN_PROGRESS:
-                raise serializers.ValidationError("Interview is not in progress.")
-        except Interview.DoesNotExist:
-            raise serializers.ValidationError("Interview not found.")
-        return value
 
 
 class HealthSerializer(serializers.Serializer):

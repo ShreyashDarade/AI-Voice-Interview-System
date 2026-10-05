@@ -1,0 +1,31 @@
+# Local/staging stack:  docker compose up --build
+services:
+  db:
+    image: postgres:17-alpine
+    environment: {POSTGRES_DB: interview, POSTGRES_USER: interview, POSTGRES_PASSWORD: change-me}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U interview"], interval: 5s, retries: 10}
+  redis:
+    image: redis:8-alpine
+  api: &app
+    build: {context: ., dockerfile: backend/Dockerfile}
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://interview:change-me@db:5432/interview
+      REDIS_URL: redis://redis:6379/0
+      TRUST_PROXY_SSL_HEADER: "true"
+    depends_on: {db: {condition: service_healthy}, redis: {condition: service_started}}
+    ports: ["8000:8000"]
+    volumes: [media:/app/media]
+    command: sh -c "python manage.py migrate --noinput && daphne -b 0.0.0.0 -p 8000 config.asgi:application"
+  watchdog:                      # pauses silent sessions, expires abandoned ones, delivers webhooks
+    <<: *app
+    ports: []
+    command: python manage.py proctor_watchdog
+    healthcheck: {disable: true}
+  purge:                         # retention: delete expired evidence/sessions daily
+    <<: *app
+    ports: []
+    command: sh -c "while true; do python manage.py proctor_purge; sleep 86400; done"
+    healthcheck: {disable: true}
+volumes: {pgdata: {}, media: {}}
